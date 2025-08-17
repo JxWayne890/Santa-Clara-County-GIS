@@ -33,6 +33,7 @@ from urllib.parse import quote_plus
 import requests
 from bs4 import BeautifulSoup
 
+
 # ------------------------------
 # Config & Endpoints
 # ------------------------------
@@ -174,7 +175,13 @@ def search_property(query: str, *, session: requests.Session | None = None) -> R
         if not geo:
             logging.warning("No geocode candidates found for address.")
             return RawSearchResult(apn=None, situs=None, parcel_feature=None, assessor_html=None)
-        x, y, in_wkid = geo["location"]["x"], geo["location"]["y"], geo["spatialReference"]["wkid"]
+
+        logging.debug("Raw geocode candidate: %r", geo)
+        x = geo["location"]["x"]
+        y = geo["location"]["y"]
+        in_wkid = (geo.get("spatialReference") or {}).get("wkid", 4326)
+        logging.debug("Geocode top candidate: x=%s y=%s wkid=%s", x, y, in_wkid)
+
         feature = arcgis_query_parcel_by_point(x, y, wkid=in_wkid, session=session)
         situs = extract_situs_from_feature(feature) if feature else None
         resolved_apn = feature["attributes"]["APN"] if feature else None
@@ -257,9 +264,9 @@ def arcgis_geocode_address(address: str, *, session: requests.Session) -> dict[s
             return None
 
         top = cands[0]
-        # Patch: Some geocoding results don’t include spatialReference
+        # Patch: Some geocoding results omit spatialReference -> default to WGS84
         if "spatialReference" not in top:
-            top["spatialReference"] = {"wkid": 4326}  # default to WGS84
+            top["spatialReference"] = {"wkid": 4326}
         return top
 
     except requests.RequestException as e:
