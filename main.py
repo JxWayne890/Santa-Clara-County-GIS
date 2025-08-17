@@ -252,7 +252,16 @@ def arcgis_geocode_address(address: str, *, session: requests.Session) -> dict[s
         cands = [c for c in cands if c.get("score", 0) >= 80]
         cands.sort(key=lambda c: c.get("score", 0), reverse=True)
         logging.debug("Geocoder returned %d viable candidate(s)", len(cands))
-        return cands[0] if cands else None
+
+        if not cands:
+            return None
+
+        top = cands[0]
+        # Patch: Some geocoding results don’t include spatialReference
+        if "spatialReference" not in top:
+            top["spatialReference"] = {"wkid": 4326}  # default to WGS84
+        return top
+
     except requests.RequestException as e:
         logging.warning("Geocode request failed: %s", e)
         return None
