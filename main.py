@@ -142,70 +142,8 @@ class RawSearchResult:
 
 
 # ------------------------------
-# 1) search_property(query)
+# ArcGIS helpers
 # ------------------------------
-
-def search_property(query: str, *, session: requests.Session | None = None) -> RawSearchResult:
-    """
-    Resolve APN from address or validate APN, fetch parcel attributes from ArcGIS,
-    then GET the assessor HTML via the APN-redirect endpoint.
-
-    Returns RawSearchResult containing low-level payloads (for parse_property_page).
-    """
-    session = session or build_session()
-    query = query.strip()
-    logging.info("search_property: %s", query)
-
-    if is_probable_apn(query):
-        apn_dashed = normalize_apn(query)
-        resolved_apn = apn_dashed
-        logging.debug("Detected APN; normalized to %s", apn_dashed)
-
-        feature = arcgis_query_parcel_by_apn(resolved_apn, session=session)
-        if not feature:
-            bare = re.sub(r"\D", "", query)
-            logging.debug("Primary APN query empty; retry LIKE on bare %s", bare)
-            feature = arcgis_query_parcel_by_apn_like(bare, session=session)
-        situs = extract_situs_from_feature(feature) if feature else None
-
-    else:
-        # Treat as address -> geocode -> spatial intersect
-        logging.debug("Detected street address; geocoding…")
-        geo = arcgis_geocode_address(query, session=session)
-        if not geo:
-            logging.warning("No geocode candidates found for address.")
-            return RawSearchResult(apn=None, situs=None, parcel_feature=None, assessor_html=None)
-
-        logging.debug("Raw geocode candidate: %r", geo)
-        x = geo["location"]["x"]
-        y = geo["location"]["y"]
-        in_wkid = (geo.get("spatialReference") or {}).get("wkid", 4326)
-        logging.debug("Geocode top candidate: x=%s y=%s wkid=%s", x, y, in_wkid)
-
-        feature = arcgis_query_parcel_by_point(x, y, wkid=in_wkid, session=session)
-        situs = extract_situs_from_feature(feature) if feature else None
-        resolved_apn = feature["attributes"]["APN"] if feature else None
-
-    # Hit assessor page (may not include owner names by policy)
-    assessor_html = None
-    if resolved_apn:
-        assessor_url = ASSESSOR_APN_REDIRECT.format(apn=quote_plus(resolved_apn))
-        logging.debug("GET assessor via %s", assessor_url)
-        try:
-            rate_limit()
-            r = session.get(assessor_url, allow_redirects=True, timeout=30)
-            r.raise_for_status()
-            assessor_html = r.text
-        except requests.RequestException as e:
-            logging.warning("Assessor page request failed: %s", e)
-
-    return RawSearchResult(
-        apn=resolved_apn,
-        situs=situs,
-        parcel_feature=feature,
-        assessor_html=assessor_html,
-    )
-
 
 def arcgis_query_parcel_by_apn(apn: str, *, session: requests.Session) -> dict[str, t.Any] | None:
     params = {
@@ -249,26 +187,36 @@ def arcgis_query_parcel_by_apn_like(bare_digits: str, *, session: requests.Sessi
 
 
 def arcgis_geocode_address(address: str, *, session: requests.Session) -> dict[str, t.Any] | None:
-    params = {"f": "json", "SingleLine": address, "outFields": "*", "maxLocations": 5}
+    """
+    Geocode an address. Returns the top candidate (with .location, .attributes, .spatialReference),
+    or None if nothing matches.
+    """
+    params = {
+        "f": "json",
+        "SingleLine": address,
+        "outFields": "*",          # ask for attributes (may include APN)
+        "maxLocations": 5,
+        # "outSR": 4326,           # optional: force WGS84; leaving off is fine
+    }
     try:
         rate_limit()
         r = session.get(ARCGIS_ADDRESS_GEOCODE, params=params, timeout=30)
         r.raise_for_status()
         js = r.json()
         cands = js.get("candidates") or []
-        cands = [c for c in cands if c.get("score", 0) >= 80]
+        # be a bit permissive
+        cands = [c for c in cands if c.get("score", 0) >= 70]
         cands.sort(key=lambda c: c.get("score", 0), reverse=True)
         logging.debug("Geocoder returned %d viable candidate(s)", len(cands))
-
         if not cands:
             return None
-
         top = cands[0]
-        # Patch: Some geocoding results omit spatialReference -> default to WGS84
+        # Patches to ensure expected keys exist
+        top.setdefault("location", {})
+        top.setdefault("attributes", {})
         if "spatialReference" not in top:
             top["spatialReference"] = {"wkid": 4326}
         return top
-
     except requests.RequestException as e:
         logging.warning("Geocode request failed: %s", e)
         return None
@@ -323,6 +271,92 @@ def extract_situs_from_feature(feature: dict[str, t.Any] | None) -> dict[str, t.
         "state": tval("SITUS_STATE_CODE") or "CA",
         "zip": (tval("SITUS_ZIP_CODE") or None),
     }
+
+
+# ------------------------------
+# 1) search_property(query)
+# ------------------------------
+
+def search_property(query: str, *, session: requests.Session | None = None) -> RawSearchResult:
+    """
+    Resolve APN from address or validate APN, fetch parcel attributes from ArcGIS,
+    then GET the assessor HTML via the APN-redirect endpoint.
+
+    Returns RawSearchResult containing low-level payloads (for parse_property_page).
+    """
+    session = session or build_session()
+    query = query.strip()
+    logging.info("search_property: %s", query)
+
+    # APN path
+    if is_probable_apn(query):
+        apn_dashed = normalize_apn(query)
+        resolved_apn = apn_dashed
+        logging.debug("Detected APN; normalized to %s", apn_dashed)
+
+        feature = arcgis_query_parcel_by_apn(resolved_apn, session=session)
+        if not feature:
+            bare = re.sub(r"\D", "", query)
+            logging.debug("Primary APN query empty; retry LIKE on bare %s", bare)
+            feature = arcgis_query_parcel_by_apn_like(bare, session=session)
+        situs = extract_situs_from_feature(feature) if feature else None
+
+    # Address path
+    else:
+        logging.debug("Detected street address; geocoding…")
+        geo = arcgis_geocode_address(query, session=session)
+        if not geo:
+            logging.warning("No geocode candidates found for address.")
+            return RawSearchResult(apn=None, situs=None, parcel_feature=None, assessor_html=None)
+
+        logging.debug("Raw geocode candidate: %r", geo)
+
+        # First try: APN directly from geocoder attributes
+        apn_from_geo = (geo.get("attributes") or {}).get("APN") or (geo.get("attributes") or {}).get("apn")
+        feature = None
+        resolved_apn = None
+        if apn_from_geo:
+            apn_norm = normalize_apn(str(apn_from_geo))
+            logging.debug("Geocoder provided APN: %s -> %s", apn_from_geo, apn_norm)
+            feature = arcgis_query_parcel_by_apn(apn_norm, session=session)
+            if not feature:
+                # try LIKE on bare digits as a fallback
+                bare = re.sub(r"\D", "", apn_norm)
+                feature = arcgis_query_parcel_by_apn_like(bare, session=session)
+            if feature:
+                resolved_apn = feature["attributes"].get("APN")
+
+        # Second try: spatial intersect if APN wasn’t present / didn’t match
+        if not feature:
+            x = geo["location"].get("x")
+            y = geo["location"].get("y")
+            in_wkid = (geo.get("spatialReference") or {}).get("wkid", 4326)
+            logging.debug("Using spatial intersect with point x=%s y=%s wkid=%s", x, y, in_wkid)
+            if x is not None and y is not None:
+                feature = arcgis_query_parcel_by_point(x, y, wkid=in_wkid, session=session)
+                resolved_apn = feature["attributes"]["APN"] if feature else None
+
+        situs = extract_situs_from_feature(feature) if feature else None
+
+    # Hit assessor page (may not include owner names by policy)
+    assessor_html = None
+    if resolved_apn:
+        assessor_url = ASSESSOR_APN_REDIRECT.format(apn=quote_plus(resolved_apn))
+        logging.debug("GET assessor via %s", assessor_url)
+        try:
+            rate_limit()
+            r = session.get(assessor_url, allow_redirects=True, timeout=30)
+            r.raise_for_status()
+            assessor_html = r.text
+        except requests.RequestException as e:
+            logging.warning("Assessor page request failed: %s", e)
+
+    return RawSearchResult(
+        apn=resolved_apn,
+        situs=situs,
+        parcel_feature=feature,
+        assessor_html=assessor_html,
+    )
 
 
 # ------------------------------
